@@ -91,25 +91,40 @@ class Config:
     task_log_path: Path
 
 
-def load_config() -> Config:
-    """从项目根 .env 加载并校验配置。
+def read_required_env() -> dict[str, str]:
+    """读项目根 .env 与环境变量，缺任一项直接终止启动。
 
-    :raises RuntimeError: 缺项或白名单解析为空时抛出
+    :raises RuntimeError: 缺少必填项时抛出
     """
     load_dotenv(ROOT_DIR / ".env")
-
-    missing = [key for key in REQUIRED_KEYS if not os.environ.get(key)]
+    values = {key: os.environ.get(key, "") for key in REQUIRED_KEYS}
+    missing = [key for key, value in values.items() if not value]
     if missing:
         raise RuntimeError(f".env 缺少配置：{', '.join(missing)}，请在项目根 .env 中补齐")
+    return values
 
-    allowed = tuple(item.strip() for item in os.environ["ALLOWED_OPEN_IDS"].split(",") if item.strip())
+
+def parse_open_ids(raw: str, terminal_open_id: str) -> tuple[str, ...]:
+    """解析白名单，并把终端身份并入。
+
+    终端是本机入口，默认可信，不需要在 ALLOWED_OPEN_IDS 里重复配置。
+
+    :raises RuntimeError: 白名单解析为空时抛出
+    """
+    allowed = tuple(item.strip() for item in raw.split(",") if item.strip())
     if not allowed:
         raise RuntimeError("ALLOWED_OPEN_IDS 解析后为空，请填入至少一个飞书用户 open_id")
+    return allowed if terminal_open_id in allowed else allowed + (terminal_open_id,)
 
+
+def load_config() -> Config:
+    """加载并校验配置：读环境 → 解析白名单与入口 → 组装 Config。"""
+    env = read_required_env()
+    terminal_user_open_id = os.environ.get(
+        "TERMINAL_USER_OPEN_ID", DEFAULT_TERMINAL_USER_OPEN_ID
+    ).strip()
+    allowed_open_ids = parse_open_ids(env["ALLOWED_OPEN_IDS"], terminal_user_open_id)
     enabled_channels = parse_channels(os.environ.get("ENABLED_CHANNELS", ",".join(DEFAULT_CHANNELS)))
-    terminal_user_open_id = os.environ.get("TERMINAL_USER_OPEN_ID", DEFAULT_TERMINAL_USER_OPEN_ID).strip()
-    # 终端是本机入口，默认可信，自动并入白名单，不需要在 ALLOWED_OPEN_IDS 里重复配置
-    allowed_open_ids = allowed if terminal_user_open_id in allowed else allowed + (terminal_user_open_id,)
 
     LOG_DIR.mkdir(exist_ok=True)
     DATA_DIR.mkdir(exist_ok=True)

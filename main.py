@@ -1,4 +1,4 @@
-"""组合根：装配配置、业务能力、网关与启用的入口渠道。
+"""组合根：加载配置、按启用的入口启动服务。
 
 入口由 .env 的 ENABLED_CHANNELS 选择，命令行 --channel 可临时覆盖；
 --ask 只在终端问一次并退出。多个入口共用同一个网关与业务对象。
@@ -20,12 +20,8 @@ from pathlib import Path
 from typing import Optional
 
 import config  # 必须先于 lark_oapi 导入，用于修正根证书路径
-from chat_agent import ChatAgent
-from feishu_channel import FeishuChannel
-from gateway import Gateway
-from llm_client import StepFunClient
+from assembly import build_runtime
 from task_log import TaskLog
-from terminal_channel import TerminalChannel
 
 logger = logging.getLogger("im_live")
 
@@ -112,45 +108,21 @@ def main() -> None:
             logger.error("已有实例在运行（锁文件 %s），请先停掉再启动", cfg.lock_path)
             return
 
-    agent = ChatAgent(StepFunClient(cfg.step_api_key, cfg.step_base_url, cfg.step_model))
-    task_log = TaskLog(cfg.task_log_path)
+    runtime = build_runtime(cfg, channels)
 
-    terminal: Optional[TerminalChannel] = None
-    if "terminal" in channels:
-        # gateway 稍后装配，这里用延迟调用的闭包；终端要等任务结束才知道答案已出完
-        terminal = TerminalChannel(
-            cfg.terminal_user_open_id, lambda msg: gateway.handle(msg)
-        )
-
-    gateway = Gateway(
-        agent,
-        cfg.allowed_open_ids,
-        task_log,
-        on_task_done=terminal.notify_done if terminal else None,
-    )
-    if terminal is not None:
-        gateway.attach_outbound(terminal)
-
-    if "feishu" in channels:
-        feishu = FeishuChannel(
-            app_id=cfg.feishu_app_id,
-            app_secret=cfg.feishu_app_secret,
-            bot_open_id=cfg.feishu_bot_open_id,
-            on_message=gateway.handle,
-        )
-        gateway.attach_outbound(feishu)
-        threading.Thread(target=feishu.start, name="feishu-ws", daemon=True).start()
+    if runtime.feishu is not None:
+        threading.Thread(target=runtime.feishu.start, name="feishu-ws", daemon=True).start()
         logger.info("飞书入口已启动，长连接建立中")
 
     if args.ask:
-        terminal.ask_once(args.ask)
+        runtime.terminal.ask_once(args.ask)
         return
 
-    if terminal is not None and stdin_can_repl():
-        terminal.start()
+    if runtime.terminal is not None and stdin_can_repl():
+        runtime.terminal.start()
         return
 
-    if terminal is not None:
+    if runtime.terminal is not None:
         logger.warning("终端入口需要交互式 stdin（当前指向 /dev/null），已跳过 REPL")
 
     logger.info("入口已在后台运行，Ctrl-C 退出")
