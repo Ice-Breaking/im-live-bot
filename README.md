@@ -42,6 +42,14 @@ pip install -r requirements.txt   # lark-oapi python-dotenv certifi openai
 
 可选：`LARK_LOG_LEVEL`（DEBUG/INFO/WARNING/ERROR，排障用 DEBUG 能看到长连接的数据帧）。
 
+复制模板再填值：
+
+```bash
+cp .env.example .env   # .env 已在 .gitignore 中，不会进版本库
+```
+
+**凭证处理**：密钥只存在于 `.env`；`.env.example` 只有键名没有值；启动日志只打印模型名与端点，不回显密钥；SDK 会把长连接地址连同 `access_key` / `ticket` 打进日志，`config.setup_logging` 挂了脱敏过滤器，日志里一律显示为 `***`。
+
 ## 启动
 
 ```bash
@@ -55,6 +63,13 @@ python3 main.py
 
 ```
 ERROR im_live: 已有实例在运行（锁文件 .../data/bot.lock），请先停掉再启动
+```
+
+后台运行（关掉终端也继续跑）：
+
+```bash
+nohup python3 main.py > /tmp/im_live_stdout.log 2>&1 &
+tail -f logs/im_live.log      # 业务日志始终在这里
 ```
 
 停止：`pkill -f "python3 main.py"`，锁随进程退出自动释放。
@@ -129,6 +144,51 @@ print(fake.log)
 PY
 ```
 
+## 三步走进度（连接 → 原样回复 → 接入业务）
+
+### 步骤一：准备连接程序（已完成）
+
+- 平台连接与消息格式只留在适配器 `feishu_channel.py`：长连接、事件归一化、`reply` 回原消息
+- 凭证：`.env` 存真实值、`.env.example` 给模板、日志脱敏
+- 启动：`python3 main.py`，`data/bot.lock` 保证只有一个实例
+
+怎么验的：构造 `P2ImMessageReceiveV1` 事件对象直接驱动 `FeishuChannel._on_message_receive`，**不发真实 API**。
+
+| 构造的事件 | 归一化结果 | 结论 |
+|---|---|---|
+| 单聊文本「你好」 | `chat_type=p2p, text='你好', sender=ou_xxx` | 符合预期 |
+| 群聊 @机器人（文本带 `<at>` 标签） | `chat_type=group, mentioned_bot=True, text='帮我看下这条'` | `<at>` 已剥离 |
+| 群聊 @别人 | `mentioned_bot=False` | 不会响应 |
+| 非文本消息（image） | 未产生入站消息 | 已跳过 |
+
+通过标志：日志出现 `connected to wss://msg-frontier.feishu.cn/ws/v2?...&access_key=***`（脱敏生效），且构造事件能产出正确的 `IncomingMessage`。
+
+### 步骤二：验证原样回复（已完成）
+
+假通道收集出站消息 + 一个返回原文的替身业务对象（`answer(question) -> question`，不调模型）：
+
+| 场景 | 出站结果 |
+|---|---|
+| 单聊原文 | 与原文逐字一致，且回复到原 `message_id` |
+| 群聊 @机器人 | 回复去掉 `<at>` 后的原文 |
+| 群聊未 @ 机器人 | 无出站消息 |
+| 越权 open_id | 拒绝并回带其真实 open_id |
+| 重复投递同一 `message_id` | 忽略，不重复回复 |
+| `/help` | 回复用法说明 |
+
+通过标志：出站内容与原文本一致；本步 `grep -c "模型调用开始" logs/im_live.log` 为 **0**，确认没有混进真实模型调用。
+
+### 步骤三：接入真实业务（已完成）
+
+业务能力复用 `chat_agent` + `llm_client`（`step-3.7-flash`），结果回原会话。
+
+| 验证 | 模型耗时 | 输出 | 端到端 |
+|---|---|---|---|
+| 假通道真实调用（问：长连接机器人与 Webhook 机器人的区别） | 5.6s | 109 字 | 5.7s |
+| 飞书真实消息（单聊） | 9.4s | 60 字 | 收到 11:06:21 → 模型完成 11:06:31 → 回复成功 11:06:32，共 11s |
+
+通过标志：飞书里收到答案，日志三段齐全（收到消息 / 模型调用完成 / 回复成功）。
+
 ## 验收记录
 
 ### 真实模型调用
@@ -184,6 +244,19 @@ grep -E "回复成功|回复失败" logs/im_live.log | tail # 3) 回复有没有
 | 启动报「已有实例在运行」 | 先 `pkill -f "python3 main.py"` |
 | `RuntimeError: .env 缺少配置` | 按「环境准备」表补齐 7 个键 |
 | WebSocket 证书校验失败 | `config.py` 会在导入 `lark_oapi` 之前把 `SSL_CERT_FILE` 指向 certifi，不要调整这几行的导入顺序 |
+
+## 平台操作位置与完成标志
+
+| 操作位置 | 做什么 | 完成标志 |
+|---|---|---|
+| 开放平台 → 凭证与基础信息 | 取 App ID / App Secret 填进 `.env` | `.env` 的值与页面一致 |
+| 权限管理 | 开通 `im:message.p2p_msg:readonly`（单聊收消息）、`im:message.group_at_msg.include_bot:readonly`（群聊 @）、`im:message:send_as_bot`（发消息） | 权限状态为「已开通」 |
+| 事件订阅 | 订阅方式选「使用长连接接收事件」，添加「接收消息 `im.message.receive_v1`」 | 页面显示长连接，事件在已添加列表里 |
+| 版本管理与发布 | 创建版本 → 申请发布 → 上线 | 页面提示「当前修改均已发布」 |
+| 机器人能力 / 可用范围 | 启用机器人，可用范围包含你自己 | 飞书里能搜到 IM_Live 并发消息 |
+| 本地 `.env` | `ALLOWED_OPEN_IDS` 填自己的 open_id（`ou_` 开头） | 启动日志不再出现「ALLOWED_OPEN_IDS 中存在非 ou_ 开头的条目」告警 |
+
+两个容易漏的点：权限改动**必须重新发布版本**才生效；单聊必须单独开 `im:message.p2p_msg:readonly`，`im:message` 总 scope 不覆盖私聊事件推送（缺少它时表现是：长连接正常、心跳正常，但一条消息都收不到）。
 
 ## 发布到 GitHub
 

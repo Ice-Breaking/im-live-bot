@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,23 @@ REQUIRED_KEYS = (
     "STEP_MODEL",
     "ALLOWED_OPEN_IDS",
 )
+
+
+# SDK 会把长连接地址原样打进日志，里面带着连接凭证，出口统一替换掉
+SECRET_PATTERN = re.compile(r"\b(access_key|ticket)=[^&\s]+")
+
+
+class CredentialRedactingFilter(logging.Filter):
+    """把日志里的 access_key 与 ticket 换成 ***。
+
+    日志形如 wss://...?...&access_key=xxx&...&ticket=xxx，这两项是真实连接凭证，
+    落到 logs/im_live.log 等于泄漏。挂在 handler 上可覆盖所有 logger，包括 SDK 自己的。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = SECRET_PATTERN.sub(r"\1=***", record.msg)
+        return True
 
 
 @dataclass(frozen=True)
@@ -91,8 +109,10 @@ def setup_logging(log_path: Path) -> None:
     )
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(CredentialRedactingFilter())
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
+    console_handler.addFilter(CredentialRedactingFilter())
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
