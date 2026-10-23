@@ -11,7 +11,8 @@
 | Gateway | `gateway.py` | 会话规则：白名单、群聊 @ 判断、重复投递拦截、`/help`；收到消息后起后台线程调模型并回答案 |
 | 业务能力 | `chat_agent.py` | 输入校验与提示词拼装，暴露 `answer(question) -> str`。不认识飞书，也不认识会话 |
 | 模型通道 | `llm_client.py` | 通过 OpenAI 兼容端点调用 StepFun，超时 180 秒 |
-| 入口 | `main.py` | 装配各层，抢占单实例文件锁，主线程跑长连接 |
+| 入口 | `main.py` | 装配各层，抢占单实例文件锁，主线程跑长连接；`--task` 查任务记录 |
+| 任务记录 | `task_log.py` | 分配任务编号、按阶段写日志与 `data/tasks.jsonl`、按编号回看 |
 | 配置 | `config.py` | 修正根证书路径、加载并校验 `.env`、配置日志 |
 
 ```
@@ -86,7 +87,7 @@ python3 main.py --channel feishu,terminal   # 两个入口同时开
 python3 main.py --ask "一句话说明长连接机器人的优点"   # 终端问一次就退出
 ```
 
-正常启动会打印：配置加载完成（含「启用入口=...」）→ 飞书入口已启动 → `connected to wss://msg-frontier.feishu.cn/ws/v2`。
+正常启动会打印：配置加载完成（含「启用入口=... 任务记录=...」）→ `平台连接: 飞书长连接 启动中` → `已建立`（同时 SDK 会打印 `connected to wss://msg-frontier.feishu.cn/ws/v2`，凭证已脱敏）。
 
 终端入口是交互式的：输入问题回车，`exit` / `quit` / Ctrl-D 退出，`/help` 看用法；答案直接打印在屏幕上。
 
@@ -139,11 +140,14 @@ tail -f logs/im_live.log
 ```
 
 ```
-收到消息: channel=feishu ... sender=ou_xxx 文本长度=9
-模型调用开始: model=step-3.7-flash 提示词长度=114
-模型调用完成: model=step-3.7-flash 耗时=4.3s 输出长度=63
-回复成功: message_id=om_xxx
-答案已回发: message_id=om_xxx 分段=1
+任务 T00006 收到消息 chat_type=p2p 文本长度=3 耗时=0ms
+任务 T00006 开始分析 问题长度=3 耗时=1ms
+chat_agent: 开始回答: 问题长度=3
+llm_client: 模型调用开始: model=step-3.7-flash 提示词长度=114
+llm_client: 模型调用完成: model=step-3.7-flash 耗时=2.1s 输出长度=74
+任务 T00006 分析完成 结果长度=74 耗时=2082ms
+feishu_channel: 回复成功: message_id=om_xxx
+任务 T00006 回复发出 分段=1 耗时=800ms
 ```
 
 ### 2) 会话规则分支（不调模型）
@@ -157,17 +161,22 @@ import config
 from chat_agent import ChatAgent
 from gateway import Gateway, IncomingMessage
 from llm_client import StepFunClient
+from task_log import TaskLog
 
 cfg = config.load_config()
 config.setup_logging(cfg.log_path)
 
 class FakeChannel:
+    """假渠道也要满足插件约定：有名字、有单条上限、失败抛 SendError。"""
+    name = "fake"
+    max_segment_chars = 20000
     def __init__(self): self.log = []
+    def start(self): pass
     def reply(self, message_id, text): self.log.append(text)
 
 fake = FakeChannel()
 gw = Gateway(ChatAgent(StepFunClient(cfg.step_api_key, cfg.step_base_url, cfg.step_model)),
-             cfg.allowed_open_ids)
+             cfg.allowed_open_ids, TaskLog(cfg.task_log_path))
 gw.attach_outbound(fake)
 
 real_id = cfg.allowed_open_ids[0]
@@ -181,6 +190,7 @@ gw.handle(msg(user_open_id="ou_not_allowed", text="你好"))     # 拒绝并回�
 gw.handle(msg(chat_type="group", mentioned_bot=False, text="你好"))   # 忽略，无出站
 gw.handle(msg(text="   "))                                    # 空消息提示
 gw.handle(msg(text="很" * 9000))                              # 超长提示
+time.sleep(2)                                                 # 后两条走后台线程，等它们跑完
 print(fake.log)
 PY
 ```
@@ -317,6 +327,9 @@ grep T00006 logs/im_live.log                    # 或者直接搜日志
 | 复用已有结果 | 同一 `message_id` 再次到达 | 模拟（无模型调用） | T00004：`复用结果重发`，全程模型调用次数仍为 1，没有重复分析 |
 | 受控发送失败 B | 真实飞书 reply API 对不存在的 `message_id` | 真实模型调用 + 真实 API 失败 | T00005：飞书返回 `code=99992354`（message_id 不存在），重试 3 次 → 回复失败，答案 79 字已保留 |
 | 日志体检 | 在 `logs/im_live.log` 里搜明文凭证与聊天原文 | 模拟 | 明文连接凭证 0 条、消息与答案原文 0 条 |
+| 会话规则分支（复核） | 照 README 的假通道示例重跑一遍 | 模拟（模型调用 0 次） | T00007~T00011：`/help` 回复用法、越权记「拒绝未授权」、群聊未 @ 记「忽略」、空消息 `EMPTY_QUESTION`、超长 `QUESTION_TOO_LONG` |
+| 三人同时提问 | 替身业务（睡 1 秒）+ 三个不同 open_id | 模拟（不调模型） | T00012~T00014：1.02s 全部返回（串行应约 3s），各回各自的 `message_id`，不串号 |
+| `--task` 复查 | `python3 main.py --task T00006` 与 `grep T00006` | 真实（读记录文件） | 四个阶段齐全，耗时与日志一致 |
 
 受控失败 B 的做法说明：把 `FEISHU_APP_SECRET` 改错会让长连接本身连不上（收不到消息，验证不到发送环节），所以改用「真实凭证 + 不存在的 `message_id`」让飞书回复 API 真实失败，效果等价且不用动凭证。
 
@@ -334,15 +347,27 @@ grep T00006 logs/im_live.log                    # 或者直接搜日志
 
 延迟几乎全部来自模型推理，换快模型是最直接的一档。改模型只动 `.env` 的 `STEP_MODEL` 一行；该端点当前可用模型：`step-3.5-flash`、`step-3.5-flash-2603`、`step-3.7-flash`、`step-5-preview`、`step-router-v1` 及语音系列。
 
-## 日志排障
+## 排查失败（按阶段定位）
 
-日志同时写控制台与 `logs/im_live.log`，按三段定位：
+日志同时写控制台与 `logs/im_live.log`。先拿到任务编号，再顺着阶段看它停在哪：
 
 ```bash
-grep "收到消息"        logs/im_live.log | tail    # 1) 事件有没有进来
-grep "模型调用完成"     logs/im_live.log | tail    # 2) 模型有没有跑完、耗时多少
-grep -E "回复成功|回复失败" logs/im_live.log | tail # 3) 回复有没有发出去
+grep -E "任务 T[0-9]+ (收到消息|回复失败)" logs/im_live.log | tail   # 1) 最近有哪些任务、哪些失败
+python3 main.py --task T00006                                      # 2) 这一条走到哪一步
+grep "回复失败" logs/im_live.log | tail                             # 3) 最近失败的有哪些
 ```
+
+停在哪个阶段，就是卡在哪：
+
+| 停在 | 含义 | 下一步 |
+|---|---|---|
+| `收到消息` | 没进分析 | 同一条记录里的阶段名就是原因：`拒绝未授权`（不在白名单）、`忽略`（群聊未 @、重复投递、渠道未注册） |
+| `开始分析` | 已进后台线程，模型还没返回 | 看有没有成对的 `模型调用开始` / `模型调用完成`；没有就是模型通道卡住（上限 180 秒） |
+| `分析失败` | 输入不合法或模型报错 | `code=EMPTY_QUESTION` / `QUESTION_TOO_LONG` 让用户改输入；`MODEL_ERROR` 查 `STEP_API_KEY` 与端点 |
+| `分析完成` 之后没有 `回复发出` | 正在发送，或在重试 | 重试会记 `重试发送`，间隔 3 秒、最多三次 |
+| `回复失败` | 三次都失败 | 答案已留在内存，同一条消息再来会 `复用结果重发`；具体原因看紧挨着的 `WARNING ... 回复失败: task=...` |
+
+失败原因只在日志里记一句（不含消息与答案原文），例如真实飞书返回 `code=99992354` 表示 `message_id` 不存在。
 
 | 现象 | 原因与处理 |
 |---|---|
@@ -365,6 +390,81 @@ grep -E "回复成功|回复失败" logs/im_live.log | tail # 3) 回复有没有
 | 本地 `.env` | `ALLOWED_OPEN_IDS` 填自己的 open_id（`ou_` 开头） | 启动日志不再出现「ALLOWED_OPEN_IDS 中存在非 ou_ 开头的条目」告警 |
 
 两个容易漏的点：权限改动**必须重新发布版本**才生效；单聊必须单独开 `im:message.p2p_msg:readonly`，`im:message` 总 scope 不覆盖私聊事件推送（缺少它时表现是：长连接正常、心跳正常，但一条消息都收不到）。
+
+## 扩展与维护：改哪里
+
+### 新增一个 IM（企业微信、Slack 等）
+
+| 步骤 | 改哪里 |
+|---|---|
+| 1. 新增渠道文件 | 如 `wecom_channel.py`，照 `terminal_channel.py` 写，只做三件事：读输入、转 `IncomingMessage`、展示结果 |
+| 2. 实现插件约定 | `name`（与 `IncomingMessage.channel` 一致）、`max_segment_chars`（单条上限，决定分段）、`start()`、`reply(target, text)`；发送失败必须抛 `SendError` |
+| 3. 登记渠道名 | `config.py` 的 `CHANNEL_NAMES` |
+| 4. 装配 | `main.py` 里构造 + `gateway.attach_outbound(channel)`；阻塞型入口用后台线程起 |
+| 5. 可选启用 | `.env` 的 `ENABLED_CHANNELS` 加上这个名字 |
+
+Gateway 与业务层不用动。四项约定见「渠道插件约定」表。
+
+### 新增业务能力
+
+只动业务层：改 `chat_agent.py` 的 `answer(question) -> str`，或在其上新增业务模块并让 Gateway 调它。渠道与 Gateway 不动；返回结果仍是字符串，分段与回程由 Gateway 与各自渠道负责。需要新配置就加进 `config.py` 的 `REQUIRED_KEYS` 与 `.env.example`。
+
+### 多人使用
+
+| 要做 | 改哪里 |
+|---|---|
+| 允许新用户 | `.env` 的 `ALLOWED_OPEN_IDS` 加 `ou_` 开头的 open_id，逗号分隔，**重启生效** |
+| 群聊可用 | 群成员也要在白名单里；群里必须 @ 机器人（`FEISHU_BOT_OPEN_ID` 决定认不认这个 @） |
+| 平台侧 | 权限与可用范围包含这些人，改动后必须重新发布版本 |
+| 并发 | 每人一个后台线程（`answer-<channel>`），无排队与限流；实测三人同时提问 1.02s 全部返回、各自回到各自的 `message_id`（替身业务，不调模型） |
+| 只允许一个进程 | `data/bot.lock`，第二个实例启动即退出 |
+
+拿不到某人的 open_id：让他给机器人发一句话，拒绝回复里会回带他的真实 open_id，直接抄进 `.env` 即可。
+
+### 长期在线
+
+- **连接**：SDK 自带心跳与断线重连，状态看 `平台连接: 飞书长连接 已建立 / 断开，重连中`；需要重连时不用干预，进程退出即断开，重启恢复
+- **容量**：去重缓存与结果缓存上限都是 200 条（`gateway.DEDUP_CACHE_SIZE`），滚动淘汰，不会无限增长
+- **日志与记录文件没有轮转**：`logs/im_live.log` 与 `data/tasks.jsonl` 都只追加。要清就停服务后删掉，`tasks.jsonl` 删除后编号会从 `T00001` 重新开始：
+
+```bash
+pkill -f "python3 main.py"; rm -f logs/im_live.log data/tasks.jsonl
+nohup python3 main.py > /tmp/im_live_stdout.log 2>&1 &
+```
+
+需要自动轮转时改 `config.setup_logging`，把 `FileHandler` 换成标准库的 `RotatingFileHandler`；`tasks.jsonl` 再另加按天切分或定期清理。
+- **机器休眠 / 断网**：长连接会断开并由 SDK 重连；休眠期间平台推的事件不会补发。
+
+## 当前状态：已完成 / 未完成 / 待验证
+
+### 已完成
+
+| 能力 | 状态 | 依据 |
+|---|---|---|
+| 飞书长连接收发消息 | 完成 | 真实消息 T00006：收到 → 分析 2.08s → 回复 0.8s |
+| 终端入口、入口可配置 | 完成 | `--channel` / `--ask` / `ENABLED_CHANNELS`，两个入口可同开 |
+| 渠道插件约定 | 完成 | `ChannelPlugin` 四项 + `reply` 失败抛 `SendError` |
+| 凭证脱敏 | 完成 | 日志里 `access_key=***`、明文凭证体检 0 条 |
+| 任务运行记录 | 完成 | 编号 `T00001` 起、五阶段、`--task` 查询，重启续号 |
+| 发送失败重试与结果保留 | 完成 | T00003 重试 3 次 → 回复失败；T00004 复用结果重发（模型调用仍 1 次）；T00005 真实 API 失败同样保留 |
+
+### 未完成（已知缺口，本轮没做）
+
+| 缺口 | 说明 |
+|---|---|
+| 日志与记录文件无轮转 | `logs/im_live.log`、`data/tasks.jsonl` 只追加，长期在线会一直变大；清理方式见上 |
+| 结果只在内存 | 发送失败的任务答案只留在进程内存里，重启后不再自动重发（`tasks.jsonl` 里仍有答案正文，但没接回自动重发） |
+| 没有限流与排队 | 多人同时提问会并发调模型，平台侧限流未考虑 |
+| 没有多轮上下文 | 每次提问独立，不带历史对话 |
+
+### 待验证（本轮没实测）
+
+| 事项 | 为什么没做 |
+|---|---|
+| 断线重连后自动恢复 | 需要断网或让机器休眠，代价高；SDK 自带重连，连接状态有日志可观察 |
+| 数小时以上连续运行 | 需要长时间挂机观察稳定性与日志增长 |
+| 群聊真实 @ | 此前只用构造事件验过归一化，没在真实群里 @ 过 |
+| 飞书里多人同时提问 | 已用替身业务并发验证线程模型（三人 1.02s、不串号），真实多人并发未做 |
 
 ## 发布到 GitHub
 
