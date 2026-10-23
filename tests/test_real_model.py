@@ -14,7 +14,7 @@ import config
 from chat_agent import ChatAgent
 from gateway import Gateway
 from llm_client import StepFunClient
-from task_log import ANALYZED, RECEIVED, SENT
+from task_stage import ANALYZED, RECEIVED, SENT
 from tests.support import FakeChannel, temp_task_log, wait_until
 
 REAL_MODEL_ENABLED = os.environ.get("IM_LIVE_REAL_MODEL") == "1"

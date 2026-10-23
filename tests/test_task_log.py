@@ -9,7 +9,8 @@ import threading
 import unittest
 from pathlib import Path
 
-from task_log import ANALYZED, RECEIVED, SENT, TaskLog
+from task_log import TaskLog
+from task_stage import ANALYZED, RECEIVED, SENT
 from tests.support import QuietLoggingTestCase, temp_task_log
 
 

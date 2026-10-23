@@ -16,6 +16,18 @@ from typing import Callable, Iterable, Optional, Protocol
 import task_log
 from chat_agent import ChatAgent, ChatInputError
 from llm_client import ModelCallError
+from task_stage import (
+    ANALYZED,
+    ANALYZE_FAILED,
+    ANALYZING,
+    RECEIVED,
+    REJECTED,
+    RETRYING,
+    REUSED,
+    SEND_FAILED,
+    SENT,
+    SKIPPED,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,19 +149,19 @@ class Gateway:
         task_id = self.task_log.new_task(msg.channel, msg.message_id, msg.user_open_id)
         self.task_log.record(
             task_id,
-            task_log.RECEIVED,
+            RECEIVED,
             detail=f"chat_type={msg.chat_type} 文本长度={len(msg.text)}",
         )
 
         outbound = self._outbound_for(msg)
         if outbound is None:
-            self.task_log.record(task_id, task_log.SKIPPED, detail="渠道未注册")
+            self.task_log.record(task_id, SKIPPED, detail="渠道未注册")
             logger.error("渠道未注册，丢弃消息: channel=%s message_id=%s", msg.channel, msg.message_id)
             self._finish(task_id)
             return task_id
 
         if msg.user_open_id not in self.allowed_open_ids:
-            self.task_log.record(task_id, task_log.REJECTED, detail="不在白名单")
+            self.task_log.record(task_id, REJECTED, detail="不在白名单")
             logger.warning("拒绝未授权发送人: sender=%s", msg.user_open_id)
             sent = self._send_with_retry(
                 task_id,
@@ -160,12 +172,12 @@ class Gateway:
                 "未授权提示",
             )
             if not sent:
-                self.task_log.record(task_id, task_log.SEND_FAILED, detail="未授权提示发送失败")
+                self.task_log.record(task_id, SEND_FAILED, detail="未授权提示发送失败")
             self._finish(task_id)
             return task_id
 
         if msg.chat_type == "group" and not msg.mentioned_bot:
-            self.task_log.record(task_id, task_log.SKIPPED, detail="群聊未 @ 机器人")
+            self.task_log.record(task_id, SKIPPED, detail="群聊未 @ 机器人")
             logger.info("群聊未 @ 机器人，忽略: chat_id=%s", msg.chat_id)
             self._finish(task_id)
             return task_id
@@ -174,7 +186,7 @@ class Gateway:
         if text in ("/help", "help", "帮助"):
             sent = self._send_with_retry(task_id, outbound, msg, HELP_TEXT, "帮助")
             self.task_log.record(
-                task_id, task_log.SENT if sent else task_log.SEND_FAILED, detail="帮助文本"
+                task_id, SENT if sent else SEND_FAILED, detail="帮助文本"
             )
             self._finish(task_id)
             return task_id
@@ -182,12 +194,12 @@ class Gateway:
         if msg.message_id in self._seen_message_ids:
             cached = self._results.get(msg.message_id)
             if cached is None:
-                self.task_log.record(task_id, task_log.SKIPPED, detail="重复投递")
+                self.task_log.record(task_id, SKIPPED, detail="重复投递")
                 logger.info("重复投递，忽略: message_id=%s", msg.message_id)
                 self._finish(task_id)
                 return task_id
             # 上次发送失败但结果还在：直接重发，不再调用模型
-            self.task_log.record(task_id, task_log.REUSED, detail="复用上次结果重发")
+            self.task_log.record(task_id, REUSED, detail="复用上次结果重发")
             self._send_segments(task_id, msg, outbound, cached)
             return task_id
 
@@ -206,30 +218,30 @@ class Gateway:
         self, task_id: str, msg: IncomingMessage, outbound: ChannelPlugin, question: str
     ) -> None:
         """后台线程：调用模型，把答案或错误提示回复到原消息。"""
-        self.task_log.record(task_id, task_log.ANALYZING, detail=f"问题长度={len(question)}")
+        self.task_log.record(task_id, ANALYZING, detail=f"问题长度={len(question)}")
         try:
             answer = self.agent.answer(question)
         except ChatInputError as exc:
             logger.info("输入不合法: task=%s code=%s", task_id, exc.code)
-            self.task_log.record(task_id, task_log.ANALYZE_FAILED, detail=f"输入不合法 code={exc.code}")
+            self.task_log.record(task_id, ANALYZE_FAILED, detail=f"输入不合法 code={exc.code}")
             sent = self._send_with_retry(task_id, outbound, msg, exc.message, "输入提示")
             if not sent:
-                self.task_log.record(task_id, task_log.SEND_FAILED, detail="输入提示发送失败")
+                self.task_log.record(task_id, SEND_FAILED, detail="输入提示发送失败")
             self._finish(task_id)
             return
         except ModelCallError as exc:
             logger.error("模型调用失败: task=%s 原因=%s", task_id, exc)
-            self.task_log.record(task_id, task_log.ANALYZE_FAILED, detail=f"模型调用失败：{exc}")
+            self.task_log.record(task_id, ANALYZE_FAILED, detail=f"模型调用失败：{exc}")
             sent = self._send_with_retry(
                 task_id, outbound, msg, f"模型调用失败（MODEL_ERROR）：{exc}", "失败提示"
             )
             if not sent:
-                self.task_log.record(task_id, task_log.SEND_FAILED, detail="失败提示发送失败")
+                self.task_log.record(task_id, SEND_FAILED, detail="失败提示发送失败")
             self._finish(task_id)
             return
 
         # 结果先留下再发：发送失败也能重发，不必重新分析
-        self.task_log.record(task_id, task_log.ANALYZED, detail=f"结果长度={len(answer)}", answer=answer)
+        self.task_log.record(task_id, ANALYZED, detail=f"结果长度={len(answer)}", answer=answer)
         self._remember_result(msg.message_id, answer)
         self._send_segments(task_id, msg, outbound, answer)
 
@@ -250,12 +262,12 @@ class Gateway:
             if not sent:
                 self.task_log.record(
                     task_id,
-                    task_log.SEND_FAILED,
+                    SEND_FAILED,
                     detail=f"{label} 重试 {SEND_MAX_TRIES} 次仍失败，结果已保留",
                 )
                 self._finish(task_id)
                 return False
-        self.task_log.record(task_id, task_log.SENT, detail=f"分段={total}")
+        self.task_log.record(task_id, SENT, detail=f"分段={total}")
         self._finish(task_id)
         return True
 
@@ -277,7 +289,7 @@ class Gateway:
                 if attempt < SEND_MAX_TRIES:
                     self.task_log.record(
                         task_id,
-                        task_log.RETRYING,
+                        RETRYING,
                         detail=f"{label} 第 {attempt} 次失败，{SEND_RETRY_INTERVAL:g} 秒后重试",
                     )
                     time.sleep(SEND_RETRY_INTERVAL)

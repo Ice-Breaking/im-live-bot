@@ -15,21 +15,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from task_stage import TaskIdAllocator
+
 logger = logging.getLogger("im_live.task")
-
-# 阶段名：日志与记录文件里都用它，保持人能直接看懂
-RECEIVED = "收到消息"
-ANALYZING = "开始分析"
-ANALYZED = "分析完成"
-SENT = "回复发出"
-SEND_FAILED = "回复失败"
-RETRYING = "重试发送"
-REUSED = "复用结果重发"
-ANALYZE_FAILED = "分析失败"
-REJECTED = "拒绝未授权"
-SKIPPED = "忽略"
-
-TASK_ID_FORMAT = "T{:05d}"
 
 
 class TaskLog:
@@ -40,7 +28,7 @@ class TaskLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         # 重启后接着历史编号往下发，避免新旧记录撞号
-        self._seq = self._read_last_seq()
+        self._ids = TaskIdAllocator(self._read_last_seq())
         self._meta: dict[str, dict] = {}
         self._last_time: dict[str, float] = {}
 
@@ -63,8 +51,7 @@ class TaskLog:
     def new_task(self, channel: str, message_id: str, user_open_id: str) -> str:
         """给一条入站消息分配编号，返回形如 T00007 的任务号。"""
         with self._lock:
-            self._seq += 1
-            task_id = TASK_ID_FORMAT.format(self._seq)
+            task_id = self._ids.next_id()
         self._meta[task_id] = {
             "channel": channel,
             "message_id": message_id,

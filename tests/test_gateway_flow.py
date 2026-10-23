@@ -12,7 +12,7 @@ from unittest import mock
 from chat_agent import ChatAgent
 from gateway import HELP_TEXT, Gateway
 from llm_client import ModelCallError
-from task_log import (
+from task_stage import (
     ANALYZED,
     ANALYZE_FAILED,
     ANALYZING,
