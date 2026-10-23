@@ -1,0 +1,6 @@
+lark-oapi
+python-dotenv
+certifi
+
+# StepFun 模型调用（OpenAI 兼容端点）
+openai

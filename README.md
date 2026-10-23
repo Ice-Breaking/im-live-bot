@@ -1,0 +1,220 @@
+# IM_live 飞书机器人
+
+用飞书自建应用的机器人：收到消息后调用阶跃星辰模型，把答案直接回复到原会话。单进程、最少依赖，没有任务单、没有数据库、没有 HTTP 接口。
+
+## 分层
+
+| 层 | 文件 | 职责 |
+|---|---|---|
+| 平台适配器 | `feishu_channel.py` | 建立飞书长连接、把消息归一化为 `IncomingMessage`、`reply` 回原消息。不含业务规则 |
+| Gateway | `gateway.py` | 会话规则：白名单、群聊 @ 判断、重复投递拦截、`/help`；收到消息后起后台线程调模型并回答案 |
+| 业务能力 | `chat_agent.py` | 输入校验与提示词拼装，暴露 `answer(question) -> str`。不认识飞书，也不认识会话 |
+| 模型通道 | `llm_client.py` | 通过 OpenAI 兼容端点调用 StepFun，超时 180 秒 |
+| 入口 | `main.py` | 装配各层，抢占单实例文件锁，主线程跑长连接 |
+| 配置 | `config.py` | 修正根证书路径、加载并校验 `.env`、配置日志 |
+
+```
+飞书 IM --WebSocket--> feishu_channel --> gateway --后台线程--> chat_agent --> llm_client --> StepFun
+                             ^                                                      
+                             +---------------- reply(原消息) ------------------------+
+```
+
+消息在后台线程处理，长连接的事件回调线程不被模型耗时占用，因此连续提问不会互相阻塞。
+
+## 环境准备
+
+依赖只有四个：
+
+```bash
+pip install -r requirements.txt   # lark-oapi python-dotenv certifi openai
+```
+
+项目根 `.env`（已被 gitignore）需要这 7 项，缺任一项启动即报错：
+
+| 键 | 说明 |
+|---|---|
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飞书自建应用的凭证 |
+| `FEISHU_BOT_OPEN_ID` | 机器人自己的 open_id，`ou_` 开头，用于判断群聊是否 @ 了机器人 |
+| `STEP_API_KEY` | StepFun 密钥 |
+| `STEP_BASE_URL` | 这里用 Step Plan 通道 `https://api.stepfun.com/step_plan/v1` |
+| `STEP_MODEL` | 现在用 `step-3.7-flash` |
+| `ALLOWED_OPEN_IDS` | 允许使用的飞书用户 open_id，`ou_` 开头，多个用逗号分隔 |
+
+可选：`LARK_LOG_LEVEL`（DEBUG/INFO/WARNING/ERROR，排障用 DEBUG 能看到长连接的数据帧）。
+
+## 启动
+
+```bash
+cd IM_live
+python3 main.py
+```
+
+正常启动会打印：配置加载完成 → 飞书机器人启动中 → `connected to wss://msg-frontier.feishu.cn/ws/v2`。
+
+**只允许跑一个实例。** 飞书同一应用的多条长连接会把事件分走，表现为「机器人不回复」。启动时会对 `data/bot.lock` 加独占锁，第二个实例看到的是：
+
+```
+ERROR im_live: 已有实例在运行（锁文件 .../data/bot.lock），请先停掉再启动
+```
+
+停止：`pkill -f "python3 main.py"`，锁随进程退出自动释放。
+
+## 飞书里怎么用
+
+| 输入 | 行为 |
+|---|---|
+| 任意一句话 | 调用模型，答案回复到这条消息下 |
+| `/help`、`help`、`帮助` | 回复用法说明 |
+| 群聊里发消息 | 只有 `@机器人` 才响应，否则忽略 |
+| 空消息 | 回「消息内容为空，请直接把想问的内容发给我」 |
+| 单次超过 8000 字 | 回「请拆分后发送」 |
+| 白名单外的账号 | 拒绝，并回带其真实 open_id，方便加进白名单 |
+
+答案超过 3000 字会自动分段，最多发 20000 字。
+
+## 本地验证
+
+### 1) 飞书端到端（真实模型调用）
+
+给机器人发一句话，日志里应出现三段：
+
+```bash
+tail -f logs/im_live.log
+```
+
+```
+收到消息: channel=feishu ... sender=ou_xxx 文本长度=9
+模型调用开始: model=step-3.7-flash 提示词长度=114
+模型调用完成: model=step-3.7-flash 耗时=4.3s 输出长度=63
+回复成功: message_id=om_xxx
+答案已回发: message_id=om_xxx 分段=1
+```
+
+### 2) 会话规则分支（不调模型）
+
+想脱离飞书单独验证，用假通道直接喂消息给 `Gateway`：
+
+```bash
+python3 - <<'PY'
+import time
+import config
+from chat_agent import ChatAgent
+from gateway import Gateway, IncomingMessage
+from llm_client import StepFunClient
+
+cfg = config.load_config()
+config.setup_logging(cfg.log_path)
+
+class FakeChannel:
+    def __init__(self): self.log = []
+    def reply(self, message_id, text): self.log.append(text)
+
+fake = FakeChannel()
+gw = Gateway(ChatAgent(StepFunClient(cfg.step_api_key, cfg.step_base_url, cfg.step_model)),
+             cfg.allowed_open_ids)
+gw.attach_outbound(fake)
+
+real_id = cfg.allowed_open_ids[0]
+def msg(**kw):
+    base = dict(channel="fake", user_open_id=real_id, chat_id="oc_probe", chat_type="p2p",
+                message_id="om_t" + str(time.time_ns()), text="", mentioned_bot=False)
+    return IncomingMessage(**{**base, **kw})
+
+gw.handle(msg(text="/help"))                                  # 用法说明
+gw.handle(msg(user_open_id="ou_not_allowed", text="你好"))     # 拒绝并回带 open_id
+gw.handle(msg(chat_type="group", mentioned_bot=False, text="你好"))   # 忽略，无出站
+gw.handle(msg(text="   "))                                    # 空消息提示
+gw.handle(msg(text="很" * 9000))                              # 超长提示
+print(fake.log)
+PY
+```
+
+## 验收记录
+
+### 真实模型调用
+
+| 场景 | 模型 | 耗时 | 结果 |
+|---|---|---|---|
+| 飞书私聊「用一句话介绍你自己」 | `step-3.7-flash` | 模型 4.3s，端到端约 5s（10:35:11 收到 → 10:35:16 回复成功） | 回复成功，63 字 |
+| 假通道同一问题 | `step-3.7-flash` | 模型 2.5s | 回复成功，53 字 |
+
+判定依据：真实调用必然成对出现 `模型调用开始` 与 `模型调用完成: model=... 耗时=...s 输出长度=...` 两行日志。
+
+### 非模型分支
+
+| 检查项 | 触发方式 | 结果 |
+|---|---|---|
+| `/help` | 假通道 | 回复用法说明，无模型调用 |
+| 越权 open_id | 假通道 | 拒绝并回带其真实 open_id |
+| 群聊未 @ 机器人 | 假通道 | 忽略，无任何出站消息 |
+| 空消息 | 假通道 | 回「消息内容为空…」，`EMPTY_QUESTION` |
+| 超长 9000 字 | 假通道 | 回「超过 8000 字上限，请拆分后发送」，`QUESTION_TOO_LONG` |
+| 重复投递同一 `message_id` | 假通道 | 日志「重复投递，忽略」，不重复回答 |
+| 第二实例启动 | 真实 | 锁冲突，打印「已有实例在运行」并退出，进程数仍为 1 |
+
+## 模型与耗时
+
+之前用 `step-5-preview`，端到端要 20~50 秒；换成 `step-3.7-flash` 后降到 5 秒左右，同一条问题的实测对比：
+
+| 模型 | 场景 | 模型耗时 | 端到端 |
+|---|---|---|---|
+| `step-5-preview` | 飞书私聊 | 51.7s | 约 52s |
+| `step-5-preview` | 飞书私聊 | 23.4s | 约 24s |
+| `step-5-preview` | HTTP 提交 | 49.5s | 50.4s |
+| `step-3.7-flash` | 飞书私聊 | 4.3s | 约 5s |
+| `step-3.7-flash` | 假通道 | 2.5s | 2.5s |
+
+延迟几乎全部来自模型推理，换快模型是最直接的一档。改模型只动 `.env` 的 `STEP_MODEL` 一行；该端点当前可用模型：`step-3.5-flash`、`step-3.5-flash-2603`、`step-3.7-flash`、`step-5-preview`、`step-router-v1` 及语音系列。
+
+## 日志排障
+
+日志同时写控制台与 `logs/im_live.log`，按三段定位：
+
+```bash
+grep "收到消息"        logs/im_live.log | tail    # 1) 事件有没有进来
+grep "模型调用完成"     logs/im_live.log | tail    # 2) 模型有没有跑完、耗时多少
+grep -E "回复成功|回复失败" logs/im_live.log | tail # 3) 回复有没有发出去
+```
+
+| 现象 | 原因与处理 |
+|---|---|
+| 完全没有「收到消息」 | 平台没有推事件。私聊必须单独开通 `im:message.p2p_msg:readonly`（`im:message` 总 scope 不覆盖私聊），群聊 @ 是 `im:message.group_at_msg.include_bot:readonly`；权限改动后必须重新创建版本并发布 |
+| 有「收到消息」但没回复 | 发送人不在 `ALLOWED_OPEN_IDS`（日志有 `拒绝未授权发送人`，回复里会带上其真实 open_id）；群聊则是未 @ 机器人 |
+| 长连接反复断开 | 网络切换或休眠导致，日志会有 `keepalive ping timeout`，SDK 会自动重连 |
+| 启动报「已有实例在运行」 | 先 `pkill -f "python3 main.py"` |
+| `RuntimeError: .env 缺少配置` | 按「环境准备」表补齐 7 个键 |
+| WebSocket 证书校验失败 | `config.py` 会在导入 `lark_oapi` 之前把 `SSL_CERT_FILE` 指向 certifi，不要调整这几行的导入顺序 |
+
+## 发布到 GitHub
+
+新建仓库表单：
+
+| 字段 | 值 |
+|---|---|
+| Owner | 你的账号（默认） |
+| Repository name | `im-live-bot` |
+| Description | `飞书机器人：长连接收消息，调用阶跃星辰模型直接回答（Python 单进程）` |
+| Visibility | Public（仓库新建、无历史提交，`.env` 已被忽略；不放心就先 Private） |
+| Add README | Off（本文件会随推送上去，勾了会冲突） |
+| Add .gitignore | No .gitignore（已有） |
+| Add license | MIT License（已带 `LICENSE` 文件，可不加） |
+
+推送前确认没有密钥和本地数据：
+
+```bash
+cd IM_live
+git init
+git add .
+git status --short                 # 列表里不应出现 .env、data/、logs/
+git check-ignore -v .env data/bot.lock logs/im_live.log
+git commit -m "feat: 飞书机器人接入阶跃星辰模型"
+git branch -M main
+git remote add origin git@github.com:<你的账号>/im-live-bot.git
+git push -u origin main
+```
+
+`data/` 里有过期的 `tasks.db`（含飞书 open_id 与旧分析记录）和 `bot.lock`，`logs/` 是运行日志，三者都已在忽略名单。**别把 `.env` 传上去**——换机器只需按「环境准备」表重建一份。
+
+## 许可
+
+MIT，见 `LICENSE`。

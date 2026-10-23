@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 运行产物：单实例锁文件与日志；data/ 下的旧任务库也不入库
+data/
+logs/
+
+# IDE 本地数据
+.codebuddy/
