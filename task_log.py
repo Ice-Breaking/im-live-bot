@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from task_stage import TaskIdAllocator
+from task_stage import ANALYZED, SENT, TaskIdAllocator
 
 logger = logging.getLogger("im_live.task")
 
@@ -107,6 +107,39 @@ class TaskLog:
                 if row.get("task_id") == task_id:
                     events.append(row)
         return events
+
+    def pending_results(self, tail_lines: int = 2000) -> dict[str, str]:
+        """取回「已分析但没发出」的结果，供重启后重发而不重新分析。
+
+        只看记录末尾若干行：结果只在内存里留最近一批，扫全文没有意义。
+        同一条消息以最后一次为准，后面出现「回复发出」就说明已经发出去了。
+        """
+        rows = self._read_tail(tail_lines)
+        pending: dict[str, str] = {}
+        for row in rows:
+            message_id = row.get("message_id", "")
+            if not message_id:
+                continue
+            stage = row.get("stage")
+            if stage == ANALYZED and row.get("answer"):
+                pending[message_id] = row["answer"]
+            elif stage == SENT:
+                pending.pop(message_id, None)
+        return pending
+
+    def _read_tail(self, tail_lines: int) -> list[dict]:
+        """读记录末尾若干行，坏的或空的行跳过。"""
+        if not self.path.exists():
+            return []
+        with self.path.open(encoding="utf-8") as handle:
+            lines = [line for line in handle if line.strip()]
+        rows = []
+        for line in lines[-tail_lines:]:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+        return rows
 
     def show(self, task_id: str) -> str:
         """把某个任务的全过程整理成人能看的几行，供 --task 使用。"""

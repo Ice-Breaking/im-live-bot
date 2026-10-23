@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Optional
+from typing import Mapping, Optional
 
 
 class ResultStore:
@@ -38,3 +38,13 @@ class ResultStore:
     def result_for(self, message_id: str) -> Optional[str]:
         """取回上次的分析结果，没有则返回 None。"""
         return self._results.get(message_id)
+
+    def restore_pending(self, results: Mapping[str, str]) -> int:
+        """启动时把上次没发出去的结果装回来，并登记为已处理。
+
+        这些消息已经分析过，再来一次直接重发，不再调用模型；返回装载条数。
+        """
+        for message_id, answer in results.items():
+            self.mark_seen(message_id)
+            self.remember(message_id, answer)
+        return len(results)

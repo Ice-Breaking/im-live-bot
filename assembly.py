@@ -5,16 +5,20 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 from chat_agent import ChatAgent
 from config import Config
 from feishu_channel import FeishuChannel
-from gateway import Gateway
+from gateway import DEDUP_CACHE_SIZE, Gateway
 from llm_client import StepFunClient
+from result_store import ResultStore
 from task_log import TaskLog
 from terminal_channel import TerminalChannel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,12 @@ def build_runtime(cfg: Config, channels: tuple[str, ...]) -> Runtime:
     """按启用的入口装配：多个入口共用同一个网关与业务对象。"""
     agent = ChatAgent(StepFunClient(cfg.step_api_key, cfg.step_base_url, cfg.step_model))
     task_log = TaskLog(cfg.task_log_path)
+    store = ResultStore(DEDUP_CACHE_SIZE)
+
+    # 上次没发出去的结果接着用：同一条消息再来时直接重发，不重新分析
+    restored = store.restore_pending(task_log.pending_results())
+    if restored:
+        logger.info("已从记录文件恢复 %d 条未发出的结果，这些消息再来时直接重发", restored)
 
     terminal: Optional[TerminalChannel] = None
     if "terminal" in channels:
@@ -41,6 +51,7 @@ def build_runtime(cfg: Config, channels: tuple[str, ...]) -> Runtime:
         cfg.allowed_open_ids,
         task_log,
         on_task_done=terminal.notify_done if terminal is not None else None,
+        store=store,
     )
     if terminal is not None:
         gateway.attach_outbound(terminal)
