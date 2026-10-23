@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from typing import Callable, Optional
 
 import config  # noqa: F401  保证根证书修正在 lark_oapi 导入前生效
@@ -21,7 +23,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
-from gateway import IncomingMessage
+from gateway import IncomingMessage, SendError
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +54,7 @@ class FeishuChannel:
         app_id: str,
         app_secret: str,
         bot_open_id: str,
-        on_message: Callable[[IncomingMessage], None],
+        on_message: Callable[[IncomingMessage], Optional[str]],
     ) -> None:
         self.app_id = app_id
         self.app_secret = app_secret
@@ -105,8 +107,10 @@ class FeishuChannel:
         response = self.client.im.v1.message.reply(request)
         if response.success():
             logger.info("回复成功: message_id=%s", message_id)
-        else:
-            logger.error("回复失败: message_id=%s code=%s msg=%s", message_id, response.code, response.msg)
+            return
+        logger.error("回复失败: message_id=%s code=%s msg=%s", message_id, response.code, response.msg)
+        # 抛给 Gateway：由它决定重试与记失败状态，结果得以保留
+        raise SendError(f"飞书回复失败 code={response.code} msg={response.msg}")
 
     def start(self) -> None:
         """建立 WebSocket 长连接并阻塞运行，SDK 内置心跳与断线重连。
@@ -120,5 +124,28 @@ class FeishuChannel:
             event_handler=self.event_handler,
             log_level=LARK_LOG_LEVELS[os.environ.get("LARK_LOG_LEVEL", "INFO").upper()],
         )
-        logger.info("正在建立飞书长连接: sdk日志级别=%s", os.environ.get("LARK_LOG_LEVEL", "INFO"))
-        ws_client.start()
+        logger.info(
+            "平台连接: 飞书长连接 启动中: sdk日志级别=%s",
+            os.environ.get("LARK_LOG_LEVEL", "INFO"),
+        )
+        # SDK 的连接回调只在断线重连时触发，首次连接得自己盯着
+        threading.Thread(
+            target=self._watch_connection, args=(ws_client,), name="conn-watch", daemon=True
+        ).start()
+        try:
+            ws_client.start()
+        except Exception as exc:
+            logger.error("平台连接: 飞书长连接 启动失败: %s", exc)
+            raise
+
+    def _watch_connection(self, ws_client: lark.ws.Client) -> None:
+        """盯住长连接对象：首次连上、断开、恢复各记一条，便于看连接是否正常。"""
+        connected = False
+        while True:
+            online = getattr(ws_client, "_conn", None) is not None
+            if online and not connected:
+                logger.info("平台连接: 飞书长连接 已建立")
+            elif not online and connected:
+                logger.warning("平台连接: 飞书长连接 断开，重连中")
+            connected = online
+            time.sleep(2)

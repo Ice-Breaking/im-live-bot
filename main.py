@@ -24,6 +24,7 @@ from chat_agent import ChatAgent
 from feishu_channel import FeishuChannel
 from gateway import Gateway
 from llm_client import StepFunClient
+from task_log import TaskLog
 from terminal_channel import TerminalChannel
 
 logger = logging.getLogger("im_live")
@@ -67,6 +68,7 @@ def parse_args() -> argparse.Namespace:
         help=f"覆盖 .env 的 ENABLED_CHANNELS，逗号分隔：{', '.join(config.CHANNEL_NAMES)}",
     )
     parser.add_argument("--ask", help="只在终端问一次并退出，不进入交互循环，也不拉起飞书长连接")
+    parser.add_argument("--task", help="按任务编号打印一次处理的全过程记录，不启动服务")
     return parser.parse_args()
 
 
@@ -74,6 +76,11 @@ def main() -> None:
     """加载配置、装配各层并启动启用的入口。"""
     args = parse_args()
     cfg = config.load_config()
+
+    if args.task:
+        print(TaskLog(cfg.task_log_path).show(args.task))
+        return
+
     config.setup_logging(cfg.log_path)
 
     channels = cfg.enabled_channels
@@ -91,11 +98,12 @@ def main() -> None:
         )
 
     logger.info(
-        "配置加载完成: model=%s base_url=%s 白名单=%d 条 启用入口=%s",
+        "配置加载完成: model=%s base_url=%s 白名单=%d 条 启用入口=%s 任务记录=%s",
         cfg.step_model,
         cfg.step_base_url,
         len(cfg.allowed_open_ids),
         ",".join(channels),
+        cfg.task_log_path,
     )
 
     if "feishu" in channels:
@@ -105,11 +113,22 @@ def main() -> None:
             return
 
     agent = ChatAgent(StepFunClient(cfg.step_api_key, cfg.step_base_url, cfg.step_model))
-    gateway = Gateway(agent, cfg.allowed_open_ids)
+    task_log = TaskLog(cfg.task_log_path)
 
     terminal: Optional[TerminalChannel] = None
     if "terminal" in channels:
-        terminal = TerminalChannel(cfg.terminal_user_open_id, gateway.handle)
+        # gateway 稍后装配，这里用延迟调用的闭包；终端要等任务结束才知道答案已出完
+        terminal = TerminalChannel(
+            cfg.terminal_user_open_id, lambda msg: gateway.handle(msg)
+        )
+
+    gateway = Gateway(
+        agent,
+        cfg.allowed_open_ids,
+        task_log,
+        on_task_done=terminal.notify_done if terminal else None,
+    )
+    if terminal is not None:
         gateway.attach_outbound(terminal)
 
     if "feishu" in channels:

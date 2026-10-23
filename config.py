@@ -88,6 +88,7 @@ class Config:
     terminal_user_open_id: str
     log_path: Path
     lock_path: Path
+    task_log_path: Path
 
 
 def load_config() -> Config:
@@ -125,6 +126,7 @@ def load_config() -> Config:
         terminal_user_open_id=terminal_user_open_id,
         log_path=LOG_DIR / "im_live.log",
         lock_path=DATA_DIR / "bot.lock",
+        task_log_path=DATA_DIR / "tasks.jsonl",
     )
 
 
