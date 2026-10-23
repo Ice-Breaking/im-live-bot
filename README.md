@@ -7,6 +7,7 @@
 | 层 | 文件 | 职责 |
 |---|---|---|
 | 平台适配器 | `feishu_channel.py` | 建立飞书长连接、把消息归一化为 `IncomingMessage`、`reply` 回原消息。不含业务规则 |
+| 终端渠道 | `terminal_channel.py` | stdin 一行一个问题，答案打印到 stdout。与飞书渠道遵守同一套约定 |
 | Gateway | `gateway.py` | 会话规则：白名单、群聊 @ 判断、重复投递拦截、`/help`；收到消息后起后台线程调模型并回答案 |
 | 业务能力 | `chat_agent.py` | 输入校验与提示词拼装，暴露 `answer(question) -> str`。不认识飞书，也不认识会话 |
 | 模型通道 | `llm_client.py` | 通过 OpenAI 兼容端点调用 StepFun，超时 180 秒 |
@@ -14,12 +15,33 @@
 | 配置 | `config.py` | 修正根证书路径、加载并校验 `.env`、配置日志 |
 
 ```
-飞书 IM --WebSocket--> feishu_channel --> gateway --后台线程--> chat_agent --> llm_client --> StepFun
-                             ^                                                      
-                             +---------------- reply(原消息) ------------------------+
+飞书 IM --WebSocket--> feishu_channel ---+
+                                          |--> gateway --后台线程--> chat_agent --> llm_client --> StepFun
+终端 stdin --REPL----> terminal_channel --+        |
+                        ^                          |
+                        +---- 按消息来源 reply -----+
 ```
 
 消息在后台线程处理，长连接的事件回调线程不被模型耗时占用，因此连续提问不会互相阻塞。
+
+## 渠道插件约定（新增入口时照着做）
+
+渠道只做三件事，业务能力与会话规则都不在渠道里：
+
+1. 连接或读取本渠道的输入；
+2. 把平台报文转换成 `IncomingMessage` 交给 `Gateway.handle`；
+3. 实现 `reply`，把结果按本渠道的方式展示出去。
+
+约定落在 `gateway.py` 的 `ChannelPlugin` 上，共四项：
+
+| 约定项 | 作用 | 飞书 | 终端 |
+|---|---|---|---|
+| `name` | 渠道名，与 `IncomingMessage.channel` 一致，Gateway 靠它把答案路由回来源入口 | `feishu` | `terminal` |
+| `max_segment_chars` | 该渠道单条消息长度上限，决定超长答案怎么分段 | 3000（飞书单条限制） | 20000（等于答案总上限，即不分段） |
+| `start()` | 开始接收本渠道的消息 | WebSocket 长连接阻塞运行 | REPL 循环读 stdin |
+| `reply(target, text)` | 展示结果 | 按 `message_id` 回复到原消息 | 打印到 stdout |
+
+装配方式：`gateway.attach_outbound(channel)` 按名字注册，**可以挂多个**。两个入口共用同一个 Gateway、同一个业务对象、同一份去重缓存；答案只回到提问的那个入口。
 
 ## 环境准备
 
@@ -39,6 +61,8 @@ pip install -r requirements.txt   # lark-oapi python-dotenv certifi openai
 | `STEP_BASE_URL` | 这里用 Step Plan 通道 `https://api.stepfun.com/step_plan/v1` |
 | `STEP_MODEL` | 现在用 `step-3.7-flash` |
 | `ALLOWED_OPEN_IDS` | 允许使用的飞书用户 open_id，`ou_` 开头，多个用逗号分隔 |
+| `ENABLED_CHANNELS` | 可选，启用哪些入口：`feishu`、`terminal`，逗号分隔，默认 `feishu`；写错启动即报错 |
+| `TERMINAL_USER_OPEN_ID` | 可选，终端入口的身份，默认 `ou_terminal`，自动并入白名单，不用再写进 `ALLOWED_OPEN_IDS` |
 
 可选：`LARK_LOG_LEVEL`（DEBUG/INFO/WARNING/ERROR，排障用 DEBUG 能看到长连接的数据帧）。
 
@@ -54,10 +78,25 @@ cp .env.example .env   # .env 已在 .gitignore 中，不会进版本库
 
 ```bash
 cd IM_live
-python3 main.py
+python3 main.py                       # 按 .env 的 ENABLED_CHANNELS 启动
+python3 main.py --channel terminal    # 命令行覆盖配置，只开终端
+python3 main.py --channel feishu,terminal   # 两个入口同时开
+python3 main.py --ask "一句话说明长连接机器人的优点"   # 终端问一次就退出
 ```
 
-正常启动会打印：配置加载完成 → 飞书机器人启动中 → `connected to wss://msg-frontier.feishu.cn/ws/v2`。
+正常启动会打印：配置加载完成（含「启用入口=...」）→ 飞书入口已启动 → `connected to wss://msg-frontier.feishu.cn/ws/v2`。
+
+终端入口是交互式的：输入问题回车，`exit` / `quit` / Ctrl-D 退出，`/help` 看用法；答案直接打印在屏幕上。
+
+```bash
+$ python3 main.py --channel terminal
+终端入口已启动，输入问题后回车；exit / quit / Ctrl-D 退出。
+你> /help
+
+助手> 机器人用法：...
+```
+
+后台运行时（`nohup`）stdin 指向 `/dev/null`，终端 REPL 会自动跳过并打印一条告警，飞书入口继续运行。
 
 **只允许跑一个实例。** 飞书同一应用的多条长连接会把事件分走，表现为「机器人不回复」。启动时会对 `data/bot.lock` 加独占锁，第二个实例看到的是：
 
@@ -211,6 +250,20 @@ PY
 | 超长 9000 字 | 假通道 | 回「超过 8000 字上限，请拆分后发送」，`QUESTION_TOO_LONG` |
 | 重复投递同一 `message_id` | 假通道 | 日志「重复投递，忽略」，不重复回答 |
 | 第二实例启动 | 真实 | 锁冲突，打印「已有实例在运行」并退出，进程数仍为 1 |
+
+## 入口与插件边界验证记录
+
+判定口径：真实模型调用必然成对出现 `模型调用开始` 与 `模型调用完成: model=step-3.7-flash 耗时=...s`；无该日志的是模拟分支。
+
+| 场景 | 怎么跑的 | 真实 / 模拟 | 结果 |
+|---|---|---|---|
+| 插件边界：两个渠道同挂一个 Gateway | 替身业务返回 7000 字，两个假渠道分别声明单条 3000 与 20000 | 模拟 | 3000 的收到 3 段、20000 的收到 1 段；先问的那个渠道的消息不会串到另一个（回程路由正确） |
+| 只开终端（命令行覆盖） | `python3 main.py --ask "..."` | 真实 | 模型 3~5s，答案打印到终端，未拉起飞书长连接 |
+| 只开终端（配置关闭飞书） | `ENABLED_CHANNELS=terminal python3 main.py --ask "..."` | 真实 | 启动日志「启用入口=terminal」，无飞书连接，答案正常 |
+| 终端 REPL | `printf '/help\n问题\nexit\n' \| python3 main.py --channel terminal` | `/help` 模拟、问题真实 | 逐条回复，`exit` 正常退出 |
+| 两个入口同开 | `python3 main.py --channel feishu,terminal`，飞书与终端各问一句 | 真实 ×2 | 同一进程内并行：飞书 11:28:03→06（2.5s），终端 11:28:05→08（3.5s），线程名 `answer-feishu` / `answer-terminal`，各自回各自的入口 |
+| 关闭终端后只开飞书 | 默认配置重启 | 真实 | 12:22:24 收到 → 12:22:28 回复成功（3.2s），飞书不受影响 |
+| 非法入口名 | `python3 main.py --channel sms` | 模拟 | 启动即报 `ENABLED_CHANNELS 含未知入口 ['sms']`，不静默降级 |
 
 ## 模型与耗时
 

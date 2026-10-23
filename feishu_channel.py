@@ -1,8 +1,8 @@
-"""飞书 IM 平台适配器。
+"""飞书 IM 渠道插件。
 
 职责：建立 WebSocket 长连接、把消息事件归一化成 IncomingMessage、按原消息回复。
 业务规则不在本模块：收到的消息交给 on_message 回调（由 Gateway 提供）。
-换其他 IM 时只替换本文件。
+新增其他入口时不动本文件，按 ChannelPlugin 约定另写一个渠道即可。
 """
 
 from __future__ import annotations
@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 # 群聊 @ 机器人时，文本内容里会带 <at user_id="ou_xxx">@名字</at>
 AT_PATTERN = re.compile(r"<at\b[^>]*>[^<]*</at>")
 
+# 飞书单条文本消息的长度上限，超长答案要按这个长度分段
+MAX_SEGMENT_CHARS = 3000
+
 # 允许通过 LARK_LOG_LEVEL 控制的 SDK 日志级别；写错时启动即报 KeyError，不静默降级
 LARK_LOG_LEVELS = {
     "DEBUG": lark.LogLevel.DEBUG,
@@ -39,6 +42,10 @@ LARK_LOG_LEVELS = {
 
 class FeishuChannel:
     """飞书长连接通道：收消息交给回调，发消息走官方 API。"""
+
+    # 渠道插件约定：名字用于回程路由，单条长度决定答案怎么分段
+    name = "feishu"
+    max_segment_chars = MAX_SEGMENT_CHARS
 
     def __init__(
         self,
@@ -72,7 +79,7 @@ class FeishuChannel:
             mention.id.open_id == self.bot_open_id for mention in (message.mentions or [])
         )
         incoming = IncomingMessage(
-            channel="feishu",
+            channel=self.name,
             user_open_id=data.event.sender.sender_id.open_id,
             chat_id=message.chat_id,
             chat_type=message.chat_type,

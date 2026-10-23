@@ -34,6 +34,27 @@ REQUIRED_KEYS = (
     "ALLOWED_OPEN_IDS",
 )
 
+# 可选配置：启用哪些入口。不配时只跑飞书；写错直接报错，不静默降级
+CHANNEL_NAMES = ("feishu", "terminal")
+DEFAULT_CHANNELS = ("feishu",)
+DEFAULT_TERMINAL_USER_OPEN_ID = "ou_terminal"
+
+
+def parse_channels(raw: str) -> tuple[str, ...]:
+    """解析入口列表：逗号分隔，只接受已知渠道名。
+
+    :raises RuntimeError: 列表为空或含未知渠道名时抛出
+    """
+    channels = tuple(item.strip() for item in raw.split(",") if item.strip())
+    if not channels:
+        raise RuntimeError("ENABLED_CHANNELS 解析后为空，至少启用一个入口：feishu 或 terminal")
+    unknown = [item for item in channels if item not in CHANNEL_NAMES]
+    if unknown:
+        raise RuntimeError(
+            f"ENABLED_CHANNELS 含未知入口 {unknown}，可用入口：{', '.join(CHANNEL_NAMES)}"
+        )
+    return channels
+
 
 # SDK 会把长连接地址原样打进日志，里面带着连接凭证，出口统一替换掉
 SECRET_PATTERN = re.compile(r"\b(access_key|ticket)=[^&\s]+")
@@ -63,6 +84,8 @@ class Config:
     step_base_url: str
     step_model: str
     allowed_open_ids: tuple[str, ...]
+    enabled_channels: tuple[str, ...]
+    terminal_user_open_id: str
     log_path: Path
     lock_path: Path
 
@@ -82,6 +105,11 @@ def load_config() -> Config:
     if not allowed:
         raise RuntimeError("ALLOWED_OPEN_IDS 解析后为空，请填入至少一个飞书用户 open_id")
 
+    enabled_channels = parse_channels(os.environ.get("ENABLED_CHANNELS", ",".join(DEFAULT_CHANNELS)))
+    terminal_user_open_id = os.environ.get("TERMINAL_USER_OPEN_ID", DEFAULT_TERMINAL_USER_OPEN_ID).strip()
+    # 终端是本机入口，默认可信，自动并入白名单，不需要在 ALLOWED_OPEN_IDS 里重复配置
+    allowed_open_ids = allowed if terminal_user_open_id in allowed else allowed + (terminal_user_open_id,)
+
     LOG_DIR.mkdir(exist_ok=True)
     DATA_DIR.mkdir(exist_ok=True)
 
@@ -92,7 +120,9 @@ def load_config() -> Config:
         step_api_key=os.environ["STEP_API_KEY"],
         step_base_url=os.environ["STEP_BASE_URL"],
         step_model=os.environ["STEP_MODEL"],
-        allowed_open_ids=allowed,
+        allowed_open_ids=allowed_open_ids,
+        enabled_channels=enabled_channels,
+        terminal_user_open_id=terminal_user_open_id,
         log_path=LOG_DIR / "im_live.log",
         lock_path=DATA_DIR / "bot.lock",
     )
