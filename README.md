@@ -8,12 +8,18 @@
 |---|---|---|
 | 平台适配器 | `feishu_channel.py` | 建立飞书长连接、把消息归一化为 `IncomingMessage`、`reply` 回原消息。不含业务规则 |
 | 终端渠道 | `terminal_channel.py` | stdin 一行一个问题，答案打印到 stdout。与飞书渠道遵守同一套约定 |
-| Gateway | `gateway.py` | 会话规则：白名单、群聊 @ 判断、重复投递拦截、`/help`；收到消息后起后台线程调模型并回答案 |
+| 渠道约定 | `channel_contract.py` | `IncomingMessage`、`ChannelPlugin`、`SendError`：渠道与 Gateway 都只依赖它 |
+| Gateway | `gateway.py` | 编排：判定之后分派，起后台线程调模型并把答案交出去 |
+| 会话规则判定 | `session_policy.py` | 只回答「这条消息该做什么」，不执行、不记日志 |
+| 出站发送 | `outbound.py` | 按渠道单条上限分段，失败按固定间隔重试，返回发送结果 |
+| 结果缓存 | `result_store.py` | 最近处理过的消息与结果，容量固定、滚动淘汰，启动时可恢复 |
 | 业务能力 | `chat_agent.py` | 输入校验与提示词拼装，暴露 `answer(question) -> str`。不认识飞书，也不认识会话 |
 | 模型通道 | `llm_client.py` | 通过 OpenAI 兼容端点调用 StepFun，超时 180 秒 |
-| 入口 | `main.py` | 装配各层，抢占单实例文件锁，主线程跑长连接；`--task` 查任务记录 |
-| 任务记录 | `task_log.py` | 分配任务编号、按阶段写日志与 `data/tasks.jsonl`、按编号回看 |
-| 配置 | `config.py` | 修正根证书路径、加载并校验 `.env`、配置日志 |
+| 任务记录 | `task_log.py` | 写日志与 `data/tasks.jsonl`、按编号回看、取回待重发结果 |
+| 任务阶段 | `task_stage.py` | 阶段名与编号分配，记录与编排共用 |
+| 装配 | `assembly.py` | 把配置、业务、网关与启用的入口接起来 |
+| 入口 | `main.py` | 加载配置、抢单实例锁、按入口启动；`--task` 查任务记录 |
+| 配置 | `config.py` | 修正根证书路径、读环境并校验、配置日志 |
 
 ```
 飞书 IM --WebSocket--> feishu_channel ---+
@@ -33,7 +39,7 @@
 2. 把平台报文转换成 `IncomingMessage` 交给 `Gateway.handle`；
 3. 实现 `reply`，把结果按本渠道的方式展示出去。
 
-约定落在 `gateway.py` 的 `ChannelPlugin` 上，共四项：
+约定落在 `channel_contract.py` 的 `ChannelPlugin` 上（gateway 会把它转出去，`from gateway import IncomingMessage, SendError` 仍然可用），共四项：
 
 | 约定项 | 作用 | 飞书 | 终端 |
 |---|---|---|---|
@@ -195,6 +201,30 @@ print(fake.log)
 PY
 ```
 
+## 测试（特征测试）
+
+测试锁的是「现在的行为」：重构前后跑同一套，全绿即行为没变。
+
+```bash
+python3 -m unittest discover -s tests -v                       # 日常：秒级，不调模型、不联网
+IM_LIVE_REAL_MODEL=1 python3 -m unittest discover -s tests -v  # 额外跑真实模型用例
+```
+
+| 文件 | 锁住什么 |
+|---|---|
+| `tests/test_gateway_flow.py` | 端到端编排：阶段顺序、分段与标题、空/超长、模型异常、越权、群聊 @、帮助、重复投递复用、发送失败重试与结果保留 |
+| `tests/test_session_policy.py` | 会话规则判定矩阵与判定顺序 |
+| `tests/test_outbound.py` | 分段长度、重试次数与间隔、失败停在第几段 |
+| `tests/test_result_store.py` | 去重登记、结果保存、容量滚动淘汰 |
+| `tests/test_result_restore.py` | 待重发结果的识别与跨重启复用（不再分析） |
+| `tests/test_task_log.py` | 编号续号、落盘字段、`--task` 输出、答案正文不进日志 |
+| `tests/test_config.py` | 校验规则、入口解析、凭证脱敏 |
+| `tests/test_channels.py` | 终端等待与输出语义、飞书归一化与发送失败抛 `SendError` |
+| `tests/test_assembly.py` | 多入口共用同一网关、答案按来源路由 |
+| `tests/test_real_model.py` | 真实模型冒烟，默认跳过 |
+
+约定：替身放在 `tests/support.py`（`StubClient` / `FakeChannel`），记录文件用临时目录，重试等待注入为 0，所以套件不联网、不调模型、不污染 `data/` 与 `logs/`；测试只用标准库，`requirements.txt` 没有测试依赖。
+
 ## 运行记录与查看方式
 
 **启动**时说清两件事：
@@ -305,7 +335,7 @@ grep T00006 logs/im_live.log                    # 或者直接搜日志
 | 群聊未 @ 机器人 | 假通道 | 忽略，无任何出站消息 |
 | 空消息 | 假通道 | 回「消息内容为空…」，`EMPTY_QUESTION` |
 | 超长 9000 字 | 假通道 | 回「超过 8000 字上限，请拆分后发送」，`QUESTION_TOO_LONG` |
-| 重复投递同一 `message_id` | 假通道 | 日志「重复投递，忽略」，不重复回答 |
+| 重复投递同一 `message_id` | 假通道 | 结果还在就 `复用结果重发`（不重新分析）；结果已被淘汰才记「重复投递，忽略」 |
 | 第二实例启动 | 真实 | 锁冲突，打印「已有实例在运行」并退出，进程数仍为 1 |
 
 ## 入口与插件边界验证记录
@@ -330,6 +360,9 @@ grep T00006 logs/im_live.log                    # 或者直接搜日志
 | 会话规则分支（复核） | 照 README 的假通道示例重跑一遍 | 模拟（模型调用 0 次） | T00007~T00011：`/help` 回复用法、越权记「拒绝未授权」、群聊未 @ 记「忽略」、空消息 `EMPTY_QUESTION`、超长 `QUESTION_TOO_LONG` |
 | 三人同时提问 | 替身业务（睡 1 秒）+ 三个不同 open_id | 模拟（不调模型） | T00012~T00014：1.02s 全部返回（串行应约 3s），各回各自的 `message_id`，不串号 |
 | `--task` 复查 | `python3 main.py --task T00006` 与 `grep T00006` | 真实（读记录文件） | 四个阶段齐全，耗时与日志一致 |
+| 重构后回归（日常套件） | `python3 -m unittest discover -s tests` | 模拟（不调模型、不联网） | 88 例全绿，约 2.5 秒；真实模型用例默认跳过 |
+| 重构后真实模型 | `IM_LIVE_REAL_MODEL=1 python3 -m unittest discover -s tests` | 真实 ×2 | 88 例全绿，真实问答与端到端各一次 |
+| 重启恢复待重发结果 | 先制造真实发送失败，再重启服务 | 真实 | T00020 真实 API 失败后结果保留；重启日志「已恢复 3 条未发出的结果」 |
 
 受控失败 B 的做法说明：把 `FEISHU_APP_SECRET` 改错会让长连接本身连不上（收不到消息，验证不到发送环节），所以改用「真实凭证 + 不存在的 `message_id`」让飞书回复 API 真实失败，效果等价且不用动凭证。
 
@@ -391,6 +424,44 @@ grep "回复失败" logs/im_live.log | tail                             # 3) 最
 
 两个容易漏的点：权限改动**必须重新发布版本**才生效；单聊必须单独开 `im:message.p2p_msg:readonly`，`im:message` 总 scope 不覆盖私聊事件推送（缺少它时表现是：长连接正常、心跳正常，但一条消息都收不到）。
 
+## 重构范围与不动点
+
+**动过的**（只调内部结构，行为不变）：
+
+| 模块 | 变化 |
+|---|---|
+| `gateway.py` | 从「一个类做六件事」收敛为编排：284 → 251 行 |
+| `channel_contract.py` | 新增：插件约定与入站消息，让渠道与编排不再互相依赖 |
+| `session_policy.py` | 新增：会话规则判定，纯函数 |
+| `outbound.py` | 新增：分段与重试，不记日志、不碰记录文件 |
+| `result_store.py` | 新增：去重缓存、结果缓存、启动时恢复 |
+| `task_stage.py` | 新增：阶段名与编号分配 |
+| `assembly.py` | 新增：装配各层 |
+| `config.py` | 内部拆成 读环境 / 解析 / 日志配置 三段 |
+| `main.py` | 只管启动方式 |
+
+**不动点**（改动即视为破坏）：
+
+| 类别 | 内容 |
+|---|---|
+| 插件约定 | `name` / `max_segment_chars` / `start()` / `reply()`，发送失败抛 `SendError` |
+| 公共接口 | `IncomingMessage` 字段、`Gateway(agent, allowed_open_ids, task_log, on_task_done=None)`、`handle() -> Optional[str]`、`attach_outbound`、两个渠道的构造与 `reply`/`start` |
+| 可见行为 | 五阶段与中文阶段名、`--task` 输出、重试 3 次间隔 3 秒、分段规则（20000 与渠道单条上限）、白名单与群聊 @、`/help` 文案、空与超长提示 |
+| 数据 | `data/tasks.jsonl` 字段名、日志脱敏规则、`.env` 键名、`ENABLED_CHANNELS` |
+| 依赖 | `requirements.txt` 未变，测试只用标准库 |
+
+**不纳入**：日志与 JSONL 轮转、限流与排队、多轮上下文、模型与端点、飞书事件归一化逻辑。
+
+**分阶段与回滚**：每阶段一个提交，回滚用 `git revert <提交号>`，任何一步都能单独回退。
+
+| 阶段 | 提交 | 内容 | 验证 |
+|---|---|---|---|
+| 0 基线 | `test: 建立特征测试基线` | 只写测试，不动产品代码 | 51 例全绿 |
+| 1 | `refactor: 抽出 task_stage` | 阶段常量与编号分配独立 | 51 例全绿 + `--task` 输出不变 |
+| 2 | `refactor: 拆出 channel_contract/session_policy/outbound/result_store` | Gateway 收敛为编排 | 75 例全绿 + `--ask` 真实冒烟 |
+| 3 | `refactor: config 拆三段，装配收敛到 assembly.py` | main 变薄 | 80 例全绿 + `--task` 输出不变 |
+| 4 | `feat: 重启后恢复未发出的结果` | **唯一行为变更** | 先红测后实现，88 例全绿 + 重启实测恢复 3 条 |
+
 ## 扩展与维护：改哪里
 
 ### 新增一个 IM（企业微信、Slack 等）
@@ -447,20 +518,24 @@ nohup python3 main.py > /tmp/im_live_stdout.log 2>&1 &
 | 凭证脱敏 | 完成 | 日志里 `access_key=***`、明文凭证体检 0 条 |
 | 任务运行记录 | 完成 | 编号 `T00001` 起、五阶段、`--task` 查询，重启续号 |
 | 发送失败重试与结果保留 | 完成 | T00003 重试 3 次 → 回复失败；T00004 复用结果重发（模型调用仍 1 次）；T00005 真实 API 失败同样保留 |
+| 结果跨重启保留 | 完成 | 重启时从 `tasks.jsonl` 恢复未发出的结果；实测恢复 3 条，同一条消息再来直接重发、不重新分析 |
+| 重构 + 特征测试 | 完成 | gateway 284 → 251 行；88 个用例全绿（2 个真实模型用例默认跳过），日常套件约 2.5 秒 |
 
 ### 未完成（已知缺口，本轮没做）
 
 | 缺口 | 说明 |
 |---|---|
 | 日志与记录文件无轮转 | `logs/im_live.log`、`data/tasks.jsonl` 只追加，长期在线会一直变大；清理方式见上 |
-| 结果只在内存 | 发送失败的任务答案只留在进程内存里，重启后不再自动重发（`tasks.jsonl` 里仍有答案正文，但没接回自动重发） |
+| 重复投递会再发一次答案 | 结果记住后，同一条消息再来会 `复用结果重发`（不重新分析）；若希望「重复投递一律忽略」，要改 `session_policy` 的判定 |
 | 没有限流与排队 | 多人同时提问会并发调模型，平台侧限流未考虑 |
 | 没有多轮上下文 | 每次提问独立，不带历史对话 |
+| `gateway.py` 仍偏长 | 251 行（原 284），剩下的主要是分支分派与阶段记录；再压就要把分派也挪走，可读性反而下降 |
 
 ### 待验证（本轮没实测）
 
 | 事项 | 为什么没做 |
 |---|---|
+| 重构后飞书真实消息 | 需要有人在飞书里发一句话；套件里的通道行为已用假渠道锁住 |
 | 断线重连后自动恢复 | 需要断网或让机器休眠，代价高；SDK 自带重连，连接状态有日志可观察 |
 | 数小时以上连续运行 | 需要长时间挂机观察稳定性与日志增长 |
 | 群聊真实 @ | 此前只用构造事件验过归一化，没在真实群里 @ 过 |
