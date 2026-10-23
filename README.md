@@ -221,6 +221,7 @@ IM_LIVE_REAL_MODEL=1 python3 -m unittest discover -s tests -v  # 额外跑真实
 | `tests/test_config.py` | 校验规则、入口解析、凭证脱敏 |
 | `tests/test_channels.py` | 终端等待与输出语义、飞书归一化与发送失败抛 `SendError` |
 | `tests/test_assembly.py` | 多入口共用同一网关、答案按来源路由 |
+| `tests/test_connection_watch.py` | 长连接守护：连上/断开/恢复各记一条，状态不变不重复记 |
 | `tests/test_real_model.py` | 真实模型冒烟，默认跳过 |
 
 约定：替身放在 `tests/support.py`（`StubClient` / `FakeChannel`），记录文件用临时目录，重试等待注入为 0，所以套件不联网、不调模型、不污染 `data/` 与 `logs/`；测试只用标准库，`requirements.txt` 没有测试依赖。
