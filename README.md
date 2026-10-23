@@ -167,7 +167,7 @@ cfg = config.load_config()
 config.setup_logging(cfg.log_path)
 
 class FakeChannel:
-    """假渠道也要满足插件约定：有名字、有单条上限、失败抛 SendError。"""
+    """假渠道也要满足插件约定：有名字、有单条上限；这里只收集结果，真实渠道发送失败要抛 SendError。"""
     name = "fake"
     max_segment_chars = 20000
     def __init__(self): self.log = []
